@@ -1,0 +1,55 @@
+node_modules/
+.next/
+out/
+build/
+.env
+.env.local
+.env*.local
+maahir.env
+env_vars.sh
+*.log
+.DS_Store
+.vercel
+next-env.d.ts
+tsconfig.tsbuildinfo
+
+# pakai npm sebagai package manager utama
+pnpm-lock.yaml
+pnpm-workspace.yaml
+
+# data files
+*.xlsx
+*.pdf
+
+# Playwright MCP transient artifacts
+.playwright-mcp/
+
+# Supabase full backup (data JSON + audio + dumps). Berisi data sensitif
+# (hash password, nomor WA). JANGAN commit.
+_backup_supabase/
+# Dump SQL berisi SEMUA data (hash password, nomor WA, data pribadi). JANGAN
+# commit — dikirim ke penerima bersama _backup_supabase, atau regen via
+# `npm run generate-dump`.
+db-migration/maahir_full_dump.sql
+
+# Arsip handoff DB (data sensitif). JANGAN commit.
+maahir-db-handoff.tar.gz
+# Hasil ekstrak arsip handoff (termasuk salinan "maahir-db-handoff (2)").
+maahir-db-handoff*/
+
+# Ekspor HITS mentah (nomor WA peserta/pengajar) — hasil kerja lokal, bukan kode.
+HITS_*.json
+HITS_*.csv
+Jadwal_HITS_*.md
+
+# Materi & dump yang ditaruh di docs/ untuk keperluan lokal.
+docs/*.mp3
+docs/dump-*.sql
+
+# Data export (PII: WA, password_hash) — never commit
+maahir-export/
+*.export.json
+
+# Penyimpanan lokal dev (STORAGE_DIR default): audio rekaman + cache snapshot
+# rekap-pertemuan. Bukan kode.
+/storage/

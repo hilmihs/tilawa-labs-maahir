@@ -1,0 +1,34 @@
+# docker-compose.yml — Postgres 17 lokal untuk restore + menjalankan Maahir.
+#
+# Aplikasi kini bicara LANGSUNG ke Postgres (via shim pg) — tidak butuh Supabase/
+# PostgREST. Compose ini opsional: cara cepat menyediakan Postgres 17 untuk
+# restore + test tanpa memasang paket sistem. Set DATABASE_URL aplikasi ke sini.
+#
+# Pakai:
+#   docker compose -f db-migration/docker-compose.yml up -d
+#   # tunggu ~5 detik, lalu (dari root repo):
+#   export DATABASE_URL="postgres://postgres:postgres@localhost:54329/postgres"
+#   psql "$DATABASE_URL" -f db-migration/00_roles.sql
+#   psql "$DATABASE_URL" -f db-migration/schema.sql
+#   npm run load-data          # butuh _backup_supabase/data + `npm i pg`
+#
+services:
+  db:
+    image: postgres:17
+    container_name: maahir-postgres
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: postgres
+    ports:
+      - "54329:5432"   # host 54329 → hindari bentrok Postgres lokal lain
+    volumes:
+      - maahir_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  maahir_pgdata:

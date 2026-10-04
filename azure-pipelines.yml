@@ -1,0 +1,237 @@
+trigger:
+  branches:
+    include:
+      - main
+
+# Pipeline ini SELURUHNYA deploy ke prod (stop service → build → start). PR
+# tidak boleh memicunya: dulu `pr: main` ikut menjalankan deploy — situs mati
+# ±3 menit dan kode yang belum di-merge sempat live. Deploy hanya dari push main.
+pr: none
+
+variables:
+  - group: Maahir-Prod # Gunakan prefix ENV_
+
+# Agent pool milik tim server ("Self Hosted") — arahan tim server 24 Sep 2026.
+# Build terjadi di server lewat SSH; agent hanya butuh bash + python3 (render env).
+pool:
+  name: Self Hosted
+
+steps:
+  - checkout: none
+  - task: Bash@3
+    displayName: "🔧 Generate exportable ENV from Variable Group"
+    # Secret variable Azure TIDAK muncul di `printenv` kecuali dipetakan eksplisit
+    # ke env task. Tanpa ini, ENV_AGENT_TOKEN/ENV_CRON_SECRET tak masuk maahir.env
+    # → runtime app tak punya token → sync web 500 & timer 401. Tambah var secret
+    # baru di sini juga.
+    env:
+      ENV_AGENT_TOKEN: $(ENV_AGENT_TOKEN)
+      ENV_CRON_SECRET: $(ENV_CRON_SECRET)
+      # CMS tilawah (modul ketersediaan). Klien membaca ENV_TILAWAH_* bila nama
+      # polosnya tidak ada; nilai "$(...)" yang belum diisi dianggap kosong.
+      ENV_TILAWAH_BASE_URL: $(ENV_TILAWAH_BASE_URL)
+      ENV_TILAWAH_EMAIL: $(ENV_TILAWAH_EMAIL)
+      ENV_TILAWAH_PASSWORD: $(ENV_TILAWAH_PASSWORD)
+    inputs:
+      targetType: "inline"
+      script: |
+        # Emit systemd EnvironmentFile format (KEY=value, NO `export`, one per line).
+        # systemd EnvironmentFile does not accept shell syntax; double-quoted values
+        # are unquoted by systemd and `$` is left literal (safe for tokens).
+        echo "🔄 Export Azure DevOps Variable Group (prefix ENV_) to systemd env file"
+        printenv | grep '^ENV_' | while IFS='=' read -r key value; do
+          safe_value=$(python3 -c "import json, os; print(json.dumps(os.getenv('$key')))")
+          echo "$key=$safe_value"
+        done > maahir.env
+
+        cat maahir.env
+  #⬇️ Kirim maahir.env ke server via SCP
+  - task: CopyFilesOverSSH@0
+    displayName: "📤 Upload maahir.env to server"
+    inputs:
+      sshEndpoint: "server-staging@103.181.142.223"
+      sourceFolder: "."
+      contents: "maahir.env"
+      targetFolder: "/var/www/html/maahir"
+      cleanTargetFolder: false
+      overwrite: true
+  - task: Ssh@0
+    displayName: "🔗 Wire maahir.env into next-maahir via systemd drop-in"
+    inputs:
+      sshEndpoint: "server-staging@103.181.142.223"
+      runOptions: "inline"
+      failOnStdErr: false
+      inline: |
+        # env_vars.sh dulu di-upload tapi tak pernah dibaca proses → semua var
+        # (ENV_PUBLIC_API dll) tak sampai ke `next start` → /api/v1/* 404.
+        # Pasang EnvironmentFile lewat drop-in (idempotent, tak perlu sentuh unit).
+        DROPIN_DIR=/etc/systemd/system/next-maahir.service.d
+        DESIRED='[Service]
+        EnvironmentFile=/var/www/html/maahir/maahir.env'
+        sudo mkdir -p "$DROPIN_DIR"
+        if [ "$(cat "$DROPIN_DIR/10-env.conf" 2>/dev/null)" != "$DESIRED" ]; then
+          echo "$DESIRED" | sudo tee "$DROPIN_DIR/10-env.conf"
+          sudo systemctl daemon-reload
+          echo "✅ EnvironmentFile drop-in installed"
+        else
+          echo "✅ drop-in already current, skip"
+        fi
+  - task: Ssh@0
+    displayName: "⏱️ Pasang systemd timer sinkron hilmihs (harian)"
+    inputs:
+      sshEndpoint: "server-staging@103.181.142.223"
+      runOptions: "inline"
+      failOnStdErr: false
+      inline: |
+        # Timer harian menembak endpoint pull ber-CRON_SECRET. Idempotent.
+        # Secret TIDAK ditulis ke berkas unit (/etc/systemd/system bisa dibaca semua
+        # user): systemd membacanya sendiri dari maahir.env lewat EnvironmentFile.
+        URL="https://maahir.example.org/api/evaluasi/sync/pull"
+        sudo tee /etc/systemd/system/next-maahir-sync.service >/dev/null <<EOF
+        [Unit]
+        Description=Pull master data hilmihs -> mirror evaluasi maahir
+        [Service]
+        Type=oneshot
+        EnvironmentFile=/var/www/html/maahir/maahir.env
+        ExecStart=/usr/bin/curl -fsS -X POST -H "Authorization: Bearer \${ENV_CRON_SECRET}" ${URL}
+        EOF
+        sudo tee /etc/systemd/system/next-maahir-sync.timer >/dev/null <<EOF
+        [Unit]
+        Description=Jalankan sinkron hilmihs tiap hari 02:00 WIB
+        [Timer]
+        OnCalendar=*-*-* 19:00:00 UTC
+        Persistent=true
+        [Install]
+        WantedBy=timers.target
+        EOF
+        sudo systemctl daemon-reload
+        sudo systemctl enable --now next-maahir-sync.timer
+        echo "✅ timer aktif:"; sudo systemctl list-timers next-maahir-sync.timer --no-pager || true
+  - task: Ssh@0
+    displayName: "⏱️ Pasang systemd timer rekap pertemuan (4x sehari)"
+    inputs:
+      sshEndpoint: "server-staging@103.181.142.223"
+      runOptions: "inline"
+      failOnStdErr: false
+      inline: |
+        # Timer 4x sehari menembak sinkron snapshot rekap pertemuan pengajar
+        # (Dashboard Edu → berkas cache). Idempotent: berkas unit ditimpa utuh.
+        # Secret TIDAK ditulis ke berkas unit (/etc/systemd/system bisa dibaca semua
+        # user): systemd membacanya sendiri dari maahir.env lewat EnvironmentFile.
+        URL="https://maahir.example.org/api/kehadiran/pertemuan/sync"
+        sudo tee /etc/systemd/system/next-maahir-pertemuan.service >/dev/null <<EOF
+        [Unit]
+        Description=Sinkron rekap pertemuan pengajar (Dashboard Edu) -> cache maahir
+        [Service]
+        Type=oneshot
+        EnvironmentFile=/var/www/html/maahir/maahir.env
+        ExecStart=/usr/bin/curl -fsS --max-time 180 -X POST -H "Authorization: Bearer \${ENV_CRON_SECRET}" ${URL}
+        EOF
+        sudo tee /etc/systemd/system/next-maahir-pertemuan.timer >/dev/null <<EOF
+        [Unit]
+        Description=Sinkron rekap pertemuan 05.30, 11.30, 16.30, 21.30 WIB
+        [Timer]
+        OnCalendar=*-*-* 22:30:00 UTC
+        OnCalendar=*-*-* 04:30:00 UTC
+        OnCalendar=*-*-* 09:30:00 UTC
+        OnCalendar=*-*-* 14:30:00 UTC
+        Persistent=true
+        [Install]
+        WantedBy=timers.target
+        EOF
+        sudo systemctl daemon-reload
+        sudo systemctl enable --now next-maahir-pertemuan.timer
+        echo "✅ timer aktif:"; sudo systemctl list-timers next-maahir-pertemuan.timer --no-pager || true
+  - task: Ssh@0
+    displayName: "🔧 Ensure nginx upload limit (audio rekaman ~14MB)"
+    inputs:
+      sshEndpoint: "server-staging@103.181.142.223"
+      runOptions: "inline"
+      failOnStdErr: false
+      inline: |
+        NGINX_SNIPPET="/etc/nginx/conf.d/maahir-upload-limit.conf"
+        if [ ! -f "$NGINX_SNIPPET" ]; then
+          echo "client_max_body_size 64m;" | sudo tee "$NGINX_SNIPPET"
+          sudo nginx -t && sudo systemctl reload nginx
+          echo "✅ nginx client_max_body_size 64m set"
+        else
+          echo "✅ nginx upload limit sudah ada, skip"
+        fi
+  - task: Ssh@0
+    displayName: "📁 Ensure audio storage dir writable (filesystem migration)"
+    inputs:
+      sshEndpoint: "server-staging@103.181.142.223"
+      runOptions: "inline"
+      failOnStdErr: false
+      inline: |
+        # Storage audio pindah Supabase→filesystem. Service next-maahir jalan root,
+        # jadi cukup pastikan folder ada (writeFile root ke dir root = OK).
+        sudo mkdir -p /var/www/html/maahir/storage/setoran-audio
+        # Service next-maahir jalan sbg user NON-root (probe /api/health kasih EACCES),
+        # jadi 0775 root:root tak cukup. 0777 supaya user service bisa tulis audio.
+        # Dir ini di balik auth app (/api/audio HMAC), bukan diekspos langsung.
+        sudo chmod -R 0777 /var/www/html/maahir/storage
+        echo "✅ storage dir:"; ls -ld /var/www/html/maahir/storage /var/www/html/maahir/storage/setoran-audio
+        df -h /var/www/html/maahir/storage | tail -1
+  - task: Ssh@0
+    displayName: "🚀 Deploy Next.js Frontend"
+    inputs:
+      sshEndpoint: "server-staging@103.181.142.223"
+      runOptions: "inline"
+      failOnStdErr: false
+      inline: |
+        echo "🚀 START: Deploy Next.js Frontend"
+        set -euo pipefail 2>/dev/null || set -eu
+
+        export NVM_DIR="$HOME/.nvm"
+        [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"
+
+        cd /var/www/html/maahir
+        echo "📂 Current folder: $(pwd)"
+
+        echo "⬇️ Git sync Web Maahir (strict)"
+        git fetch origin main
+        git reset --hard origin/main
+        echo "📌 Deployed commit: $(git log -1 --oneline)"
+
+        echo "📦 Install dependency Web Maahir"
+        nvm exec 24.15.0 npm install
+
+        # Service jalan sebagai root dan terus menulis cache runtime ke
+        # .next/standalone/.next selama ia hidup. Kalau build jalan bersamaan,
+        # Next gagal menimpa direktori root-owned itu:
+        #   EACCES: permission denied, rmdir '.next/standalone/.next'
+        # Karena versi lama sudah terhapus, kegagalan itu meninggalkan server
+        # tanpa berkas — aset 500, situs tak terpakai.
+        #
+        # Maka: hentikan service dulu supaya tak ada penulis lain, JANGAN hapus
+        # .next (cukup ambil alih kepemilikannya). Build yang gagal kini
+        # menyisakan build lama utuh, dan trap menghidupkannya kembali.
+        echo "⏸️ Stop service selama build (hindari race root vs user)"
+        sudo systemctl stop next-maahir
+
+        # Build gagal → hidupkan lagi versi lama yang masih di disk.
+        rollback() {
+          echo "⚠️ Build gagal — menghidupkan kembali build sebelumnya"
+          sudo systemctl start next-maahir || true
+          sudo systemctl status next-maahir --no-pager || true
+        }
+        trap rollback ERR
+
+        echo "🔑 Ambil alih kepemilikan .next (cache runtime bisa root-owned)"
+        sudo mkdir -p .next
+        sudo chown -R "$(id -u):$(id -g)" .next
+
+        echo "⚙️ Build Web Maahir"
+        nvm exec 24.15.0 npm run build
+
+        echo "📁 Copy static files to standalone folder"
+        cp -r .next/static .next/standalone/.next/
+
+        trap - ERR
+
+        echo "▶️ Start systemd service"
+        sudo systemctl start next-maahir
+        sudo systemctl status next-maahir --no-pager
+
+        echo "✅ Next.js frontend deployment selesai"
