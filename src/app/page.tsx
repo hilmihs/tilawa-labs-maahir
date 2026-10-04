@@ -1,5 +1,6 @@
 import { redirect } from 'next/navigation';
 import { LoginForm } from '@/components/LoginForm';
+import { AkunDemo } from '@/components/AkunDemo';
 import { getSession, getAllAccesses } from '@/lib/session';
 import { currentCycleStart, formatCycleRange } from '@/lib/week';
 import { formatCycleRangeShort } from '@/lib/week';
@@ -228,6 +229,8 @@ export default async function HomePage({ searchParams }: { searchParams: { next?
           </div>
 
           <LoginForm next={safeNext ?? undefined} />
+
+          <AkunDemo />
 
           {/* Shakwa terbuka tanpa akun — pelapor luar tetap punya jalan masuk. */}
           <a href="/shakwa" className="kartu-emas" style={{ display: 'flex', alignItems: 'center', gap: 14, textDecoration: 'none', color: 'inherit', marginTop: 8 }}>
